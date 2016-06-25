@@ -2,7 +2,8 @@
 
 [![GoDoc](https://godoc.org/gopkg.in/hypirion/go-filecache.v1?status.svg)](https://godoc.org/gopkg.in/hypirion/go-filecache.v1)
 
-Two-way filecache for golang for putting and getting values from a bigger
+Two-way filecache for golang for putting and getting values from a file storage
+option.
 
 ## Installation and Usage
 
