@@ -17,16 +17,16 @@ var ErrCacheClosed = errors.New("filecache is closed")
 // should also return true.
 //
 // Get retrieves a file and stores it in the file at localPath. If a file with
-// the associated key does not exist in the file store, then io.ErrNotExist
+// the associated key does not exist in the file store, then an error
 // should be returned.
 //
 // Put sends a file to the file store and stores it there. If a file associated
-// with the key already exist in the file storage, then io.ErrExist should be
-// thrown.
+// with the key already exist in the file storage, then an error should be
+// returned.
 type FileStorage interface {
 	Has(key string) (bool, error)
 	Get(dst io.Writer, key string) error
-	// Put(key, src io.Reader) error
+	Put(key string, src io.Reader) error
 }
 
 type Size int64
@@ -190,6 +190,13 @@ func (fc *Filecache) Get(dst io.Writer, key string) (err error) {
 			return
 		}
 	}
+	defer func() {
+		if !goodEntry {
+			fc.lock.Lock()
+			delete(fc.inTransit, key)
+			fc.lock.Unlock()
+		}
+	}()
 
 	// Not in cache and we just added an in-transit entry, so we should probably
 	// retrieve the thing.
@@ -205,7 +212,7 @@ func (fc *Filecache) Get(dst io.Writer, key string) (err error) {
 	defer func() {
 		if !goodEntry {
 			entryFile.Close()
-			os.Remove(entryFile.Name())
+			os.Remove(newEntry.path)
 			// Should we do anything with this error? Presumably it's okay to
 			// leave it be, as the temp file will be empty and in the temp dir, so
 			// it should be cleaned up after some time.
@@ -388,10 +395,12 @@ func (fc *Filecache) deleteEntries(entries []*cacheEntry) {
 func deleteEntry(entry *cacheEntry) {
 	entry.Lock()
 	defer entry.Unlock()
-	entry.removed = true
-	os.Remove(entry.path)
-	// TODO?: can this panic? If not, we may avoid the defer entry and we may as
-	// well inline it into deleteEntries
+	if !entry.removed {
+		entry.removed = true
+		os.Remove(entry.path)
+		// TODO?: can this panic? If not, we may avoid the defer entry and we may as
+		// well inline it into deleteEntries
+	}
 }
 
 func (ce *cacheEntry) copyTo(dst io.Writer) (bool, error) {
@@ -419,4 +428,96 @@ func copyFile(dst io.Writer, src string) error {
 	_, err = io.Copy(dst, f)
 	// TODO: Wrap?
 	return err
+}
+
+// How to put into cache?
+// Add to in-transit
+
+func (fc *Filecache) Put(key string, src io.Reader) (err error) {
+	goodEntry := false
+	newEntry := &cacheEntry{
+		key: key,
+	}
+	newEntry.Lock() // lock it immediately to avoid premature reads.
+	defer func() {
+		if !goodEntry {
+			newEntry.removed = true
+		}
+		newEntry.Unlock()
+	}()
+
+	fc.lock.Lock()
+	closed := fc.closed
+	var existingEntry *cacheEntry
+	if !closed {
+		existingEntry = fc.getEntry(key)
+		if existingEntry == nil {
+			fc.inTransit[key] = newEntry
+		}
+	}
+	fc.lock.Unlock()
+	if closed {
+		return ErrCacheClosed
+	}
+	if existingEntry != nil {
+		return os.ErrExist
+	}
+	defer func() {
+		if !goodEntry {
+			fc.lock.Lock()
+			delete(fc.inTransit, key)
+			fc.lock.Unlock()
+		}
+	}()
+
+	// Create temp file to store contents in.
+	var entryFile *os.File
+	entryFile, err = ioutil.TempFile(fc.tmpFolder, key+"-")
+	if err != nil {
+		// TODO: wrap this one
+		return err
+	}
+	newEntry.path = entryFile.Name()
+	defer func() {
+		if !goodEntry {
+			entryFile.Close()
+			os.Remove(newEntry.path)
+			// Should we do anything with this error? Presumably it's okay to
+			// leave it be, as the temp file will be empty and in the temp dir, so
+			// it should be cleaned up after some time.
+		}
+	}()
+
+	var fileSize int64
+	fileSize, err = io.Copy(entryFile, src)
+	if err != nil {
+		return err
+	}
+	newEntry.fileSize = fileSize
+
+	err = entryFile.Close()
+	if err != nil {
+		return err
+	}
+
+	// Reopen and call the inner put
+	entryFile, err = os.Open(newEntry.path)
+	if err != nil {
+		return err
+	}
+	err = fc.subStorage.Put(key, entryFile)
+	if err != nil {
+		return err
+	}
+
+	err = entryFile.Close()
+	if err != nil {
+		return err
+	}
+
+	// alright, entry is good
+	fc.insertEntry(newEntry)
+
+	goodEntry = true
+	return nil
 }
