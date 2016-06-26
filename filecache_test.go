@@ -1,3 +1,7 @@
+// Copyright 2016 Jean Niklas L'orange.  All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package filecache
 
 import (
@@ -120,7 +124,7 @@ func (m *unstableSyncMap) Get(dst io.Writer, key string) error {
 }
 
 func TestSerialGetting(t *testing.T) {
-	fc, _ := NewFilecache(100*Byte, newKeyCounter())
+	fc, _ := New(100*Byte, newKeyCounter())
 	defer fc.Close()
 	for i := 0; i < 1000; i++ {
 		key := strconv.Itoa(i)
@@ -130,7 +134,7 @@ func TestSerialGetting(t *testing.T) {
 }
 
 func TestConcurrentGetting(t *testing.T) {
-	fc, _ := NewFilecache(100*Byte, newKeyCounter())
+	fc, _ := New(100*Byte, newKeyCounter())
 	defer fc.Close()
 
 	rand.Seed(time.Now().UnixNano())
@@ -151,7 +155,7 @@ func TestConcurrentGetting(t *testing.T) {
 }
 
 func TestSerialUnstable(t *testing.T) {
-	fc, _ := NewFilecache(100*Byte, newUnstableSyncMap(0.5))
+	fc, _ := New(100*Byte, newUnstableSyncMap(0.5))
 	defer fc.Close()
 
 	rand.Seed(time.Now().UnixNano())
@@ -209,7 +213,7 @@ func TestSerialUnstable(t *testing.T) {
 }
 
 func TestConcurrentUnstableAbruptClose(t *testing.T) {
-	fc, _ := NewFilecache(100*Byte, newUnstableSyncMap(0.5))
+	fc, _ := New(100*Byte, newUnstableSyncMap(0.5))
 
 	rand.Seed(time.Now().UnixNano())
 
@@ -268,7 +272,7 @@ func TestConcurrentUnstableAbruptClose(t *testing.T) {
 func TestCached(t *testing.T) {
 	// Tests that lru actually happens
 	kc := newKeyCounter()
-	fc, _ := NewFilecache(50*Byte, kc)
+	fc, _ := New(50*Byte, kc)
 	defer fc.Close()
 	for i := 0; i < 100; i++ {
 		for j := 0; j < 3; j++ {
@@ -284,7 +288,7 @@ func TestCached(t *testing.T) {
 }
 
 func TestAbruptClose(t *testing.T) {
-	fc, _ := NewFilecache(100*Byte, newKeyCounter())
+	fc, _ := New(100*Byte, newKeyCounter())
 
 	rand.Seed(time.Now().UnixNano())
 	var wgDone sync.WaitGroup

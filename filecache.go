@@ -1,3 +1,7 @@
+// Copyright 2016 Jean Niklas L'orange.  All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package filecache
 
 import (
@@ -43,7 +47,7 @@ const (
 	TiB       = 1024 * GiB
 )
 
-func NewFilecache(maxSize Size, storage FileStorage) (*Filecache, error) {
+func New(maxSize Size, storage FileStorage) (*Filecache, error) {
 	tmpDir, err := ioutil.TempDir("", "filecache-")
 	if err != nil {
 		return nil, err
@@ -270,11 +274,10 @@ func (fc *Filecache) Get(dst io.Writer, key string) (err error) {
 // hit places the cache entry at the top of the lru-cache if it is still in the
 // cache.
 func (fc *Filecache) hit(entry *cacheEntry) {
-	// update this entry's location in the file cache.
 	fc.lock.Lock()
 	closed := fc.closed
-	// It may have already been evicted by others, so check if we're still in the
-	// cache. Since we nil the links, we can just check those.
+	// The entry may have already been evicted by others, so check if we're still
+	// in the cache. Since we nil the links, we can just check those.
 
 	// There's another edge case: We are already the root. In that case, we don't
 	// have to do anything either.
@@ -288,7 +291,7 @@ func (fc *Filecache) hit(entry *cacheEntry) {
 		oldNext.prev = oldPrev
 
 		// then just do as in insertEntry. We don't have to check root here because
-		// we have the links.
+		// we have the links, which guarantees a root.
 		entry.next = fc.root
 		entry.prev = fc.root.prev
 		entry.prev.next = entry
