@@ -23,7 +23,7 @@ import (
 type FileStorage interface {
 	Has(key string) (bool, error)
 	Get(dst io.Writer, key string) error
-	Put(key, src io.Reader) error
+	// Put(key, src io.Reader) error
 }
 
 type Size int64
@@ -40,8 +40,18 @@ const (
 	TiB       = 1024 * GiB
 )
 
-func NewFilecache(maxSize Size) *Filecache {
-	return nil
+func NewFilecache(maxSize Size, storage FileStorage) (*Filecache, error) {
+	tmpDir, err := ioutil.TempDir("", "filecache-")
+	if err != nil {
+		return nil, err
+	}
+	return &Filecache{
+		inTransit:  make(map[string]*cacheEntry),
+		cache:      make(map[string]*cacheEntry),
+		tmpFolder:  tmpDir,
+		maxSize:    int64(maxSize),
+		subStorage: storage,
+	}, nil
 }
 
 type Filecache struct {
@@ -136,11 +146,11 @@ func (fc *Filecache) Get(dst io.Writer, key string) (err error) {
 	}
 
 	// Not in cache and we just added an in-transit entry, so we should probably
-	// download the thing.
+	// retrieve the thing.
 
 	// Create temp file to store contents in.
 	var entryFile *os.File
-	entryFile, err = ioutil.TempFile(fc.tmpFolder, key)
+	entryFile, err = ioutil.TempFile(fc.tmpFolder, key+"-")
 	if err != nil {
 		// TODO: wrap this one
 		return err
@@ -181,11 +191,8 @@ func (fc *Filecache) Get(dst io.Writer, key string) (err error) {
 	}
 
 	// Then the last part: Insert it into the cache
-	fc.lock.Lock()
-	fc.size += fileSize
-	delete(fc.inTransit, key)
+
 	fc.insertEntry(newEntry)
-	fc.lock.Unlock()
 
 	// At this point we have a sound entry in the cache. We can go on with our
 	// lives and copy it over to the local file.
@@ -207,23 +214,131 @@ func (fc *Filecache) Get(dst io.Writer, key string) (err error) {
 	return err
 }
 
+// hit places the cache entry at the top of the lru-cache if it is still in the
+// cache.
 func (fc *Filecache) hit(entry *cacheEntry) {
 	// update this entry's location in the file cache.
+	fc.lock.Lock()
+	// It may have already been evicted by others, so check if we're still in the
+	// cache. Since we nil the links, we can just check those.
 
-	// Ughhh: We need a lock on
+	// There's another edge case: We are already the root. In that case, we don't
+	// have to do anything either.
+	if entry.prev != nil && fc.root != entry {
+		// This is similar to insertEntry, except that we also have to remove our
+		// original position first. This is done by connecting prev and next to
+		// eachother.
+		oldPrev := entry.prev
+		oldNext := entry.next
+		oldPrev.next = oldNext
+		oldNext.prev = oldPrev
+
+		// then just do as in insertEntry. We don't have to check root here because
+		// we have the links.
+		entry.next = fc.root
+		entry.prev = fc.root.prev
+		entry.prev.next = entry
+		entry.next.prev = entry
+		fc.root = entry
+	}
+	fc.lock.Unlock()
 }
 
 func (fc *Filecache) insertEntry(entry *cacheEntry) {
-	// TODO: Is this sound? Presumably: Users will only pull out an entry via
+	// TODO(?): Is this sound? Presumably: Users will only pull out an entry via
 	// getEntry, and whenever a value is put in transit, we explicitly check that
 	// there are no other entries. Only values put in transit (and removed) will
 	// be given here, so it is sound.
+	fc.lock.Lock()
+	// No defer here, because this should NOT fail.
+	fc.size += entry.fileSize
+	delete(fc.inTransit, entry.key)
 	fc.cache[entry.key] = entry
 
 	// Put into LRU.
+	if fc.root == nil {
+		fc.root = entry
+		entry.prev = entry
+		entry.next = entry
+	} else {
+		// Explanation:
+		//              root
+		//               |
+		//               v
+		// +------+   +------+   +------+
+		// |r.prev|<->|   r  |<->|r.next|
+		// +------+   +------+   +------+
+		//
+		// Add replace entry with r, by bumping it to the right
+		//
+		//              root
+		//               |
+		//               v
+		// +------+   +------+   +------+    +------+
+		// |r.prev|<->| entry|<->|   r  |<-> |r.next|
+		// +------+   +------+   +------+    +------+
+		//
+		// (Obviously, r.prev is not r.prev anymore, but rather entry.prev)
+
+		entry.next = fc.root
+		entry.prev = fc.root.prev
+		entry.prev.next = entry
+		entry.next.prev = entry
+		fc.root = entry
+	}
 
 	// Then remove excessive entries.
-	//fc.removeLRU()
+	fc.removeLRU()
+
+	fc.lock.Unlock()
+}
+
+func (fc *Filecache) removeLRU() {
+	toDelete := []*cacheEntry{}
+	last := fc.root.prev
+	for fc.maxSize < fc.size {
+		fc.size -= last.fileSize
+
+		lastPrev := last.prev
+		toDelete = append(toDelete, last)
+		// remove last from cache by removing prev and next on it, and connecting
+		// lastPrev to root.
+		delete(fc.cache, last.key)
+
+		last.prev = nil
+		last.next = nil
+		// If last == lastPrev then we only have a single entry. Which means that
+		// the file itself is larger than the cache, which is silly for usage, but
+		// oh well.
+		if last == lastPrev {
+			fc.root = nil
+		} else {
+			lastPrev.next = fc.root
+			fc.root.prev = lastPrev
+			last = lastPrev
+		}
+
+	}
+	go deleteEntries(toDelete)
+}
+
+// deletesEntries deletes cache entries synchronously. This must not be done on
+// entries that are inside the cache, only the ones that are explicitly evicted.
+func deleteEntries(entries []*cacheEntry) {
+	for _, entry := range entries {
+		deleteEntry(entry)
+	}
+}
+
+// deleteEntry deletes a single cache entry from disk. It must not be done on
+// entries inside the cache, just the ones explicitly evicted from it.
+func deleteEntry(entry *cacheEntry) {
+	entry.Lock()
+	defer entry.Unlock()
+	entry.removed = true
+	os.Remove(entry.path)
+	// TODO?: can this panic? If not, we may avoid the defer entry and we may as
+	// well inline it into deleteEntries
 }
 
 func (ce *cacheEntry) copyTo(dst io.Writer) (bool, error) {
