@@ -55,16 +55,17 @@ func getKeyCounter(t *testing.T, fs FileStorage, key string) {
 
 func TestSerialGetting(t *testing.T) {
 	fc, _ := NewFilecache(100*Byte, newKeyCounter())
+	defer fc.Close()
 	for i := 0; i < 1000; i++ {
 		key := strconv.Itoa(i)
 		getKeyCounter(t, fc, key)
 	}
-	// Ensure we give the  flush out entries
-	time.Sleep(100 * time.Millisecond)
+
 }
 
 func TestConcurrentGetting(t *testing.T) {
 	fc, _ := NewFilecache(100*Byte, newKeyCounter())
+	defer fc.Close()
 
 	rand.Seed(time.Now().UnixNano())
 	var wg sync.WaitGroup
@@ -81,14 +82,13 @@ func TestConcurrentGetting(t *testing.T) {
 	}
 
 	wg.Wait()
-	// Ensure we give the  flush out entries
-	time.Sleep(100 * time.Millisecond)
 }
 
 func TestCached(t *testing.T) {
-	// Tests that lru actually happened
+	// Tests that lru actually happens
 	kc := newKeyCounter()
 	fc, _ := NewFilecache(50*Byte, kc)
+	defer fc.Close()
 	for i := 0; i < 100; i++ {
 		for j := 0; j < 3; j++ {
 			getKeyCounter(t, fc, "foo")
@@ -100,4 +100,43 @@ func TestCached(t *testing.T) {
 		t.Errorf(`Expected "foo" to be looked up only once, was looked up %d times`,
 			kc.vals["foo"])
 	}
+}
+
+func TestAbruptClose(t *testing.T) {
+	fc, _ := NewFilecache(100*Byte, newKeyCounter())
+
+	rand.Seed(time.Now().UnixNano())
+	var wgDone sync.WaitGroup
+	var wgStarted sync.WaitGroup
+
+	for i := 0; i < 1000; i++ {
+		wgStarted.Add(1)
+		wgDone.Add(1)
+		go func() {
+			defer wgDone.Done()
+			started := false
+			for {
+				key := strconv.Itoa(rand.Intn(1000))
+				var b bytes.Buffer
+				err := fc.Get(&b, key)
+				if !started {
+					started = true
+					wgStarted.Done()
+				}
+				if err == ErrCacheClosed {
+					return // as expected
+				}
+				if err != nil {
+					t.Fatalf("Error retrieving key %q", key)
+				}
+				if b.String() != key {
+					t.Errorf("Expected to get back %q, got %q", key, b.String())
+				}
+			}
+		}()
+	}
+
+	wgStarted.Wait()
+	fc.Close()
+	wgDone.Wait()
 }

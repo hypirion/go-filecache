@@ -1,11 +1,14 @@
 package filecache
 
 import (
+	"errors"
 	"io"
 	"io/ioutil"
 	"os"
 	"sync"
 )
+
+var ErrCacheClosed = errors.New("filecache is closed")
 
 // FileStorage is an interface for putting and retrieving immutable files.
 //
@@ -54,6 +57,28 @@ func NewFilecache(maxSize Size, storage FileStorage) (*Filecache, error) {
 	}, nil
 }
 
+func (fc *Filecache) Close() {
+	entries := []*cacheEntry{}
+	fc.lock.Lock()
+	fc.closed = true
+	fc.maxSize = 0
+	// find all elements
+	for _, entry := range fc.inTransit {
+		entries = append(entries, entry)
+	}
+	if fc.root != nil {
+		entries = append(entries, fc.root)
+		for node := fc.root.next; node != fc.root; node = node.next {
+			entries = append(entries, node)
+		}
+	}
+	fc.deleters.Add(1)
+	go fc.deleteEntries(entries)
+	fc.lock.Unlock()
+	fc.deleters.Wait()
+	os.RemoveAll(fc.tmpFolder)
+}
+
 type Filecache struct {
 	lock       sync.RWMutex
 	subStorage FileStorage
@@ -63,6 +88,8 @@ type Filecache struct {
 	root       *cacheEntry
 	size       int64
 	maxSize    int64
+	closed     bool
+	deleters   sync.WaitGroup
 }
 
 type cacheEntry struct {
@@ -79,8 +106,14 @@ func (fc *Filecache) Has(key string) (res bool, err error) {
 	// have a race condition where we attempt to download a file, then call Has,
 	// then the download finds out the file does not exist and bails out.
 	fc.lock.RLock()
-	_, res = fc.cache[key]
+	closed := fc.closed
+	if !closed {
+		_, res = fc.cache[key]
+	}
 	fc.lock.RUnlock()
+	if closed {
+		return false, ErrCacheClosed
+	}
 	if res {
 		return
 	}
@@ -104,8 +137,15 @@ func (fc *Filecache) Get(dst io.Writer, key string) (err error) {
 	// Check in cache first, to avoid the tiny overhead of making a cache entry
 	// (this is probably slightly premature)
 	fc.lock.RLock()
-	existingEntry := fc.getEntry(key)
+	closed := fc.closed
+	var existingEntry *cacheEntry
+	if !closed {
+		existingEntry = fc.getEntry(key)
+	}
 	fc.lock.RUnlock()
+	if closed {
+		return ErrCacheClosed
+	}
 	if existingEntry != nil {
 		var notDeleted bool
 		notDeleted, err = existingEntry.copyTo(dst)
@@ -129,13 +169,19 @@ func (fc *Filecache) Get(dst io.Writer, key string) (err error) {
 	}()
 
 	fc.lock.Lock()
+	closed = fc.closed
 	// Race condition: There may now be an entry in either the cache or in
 	// transit, so let's check those before we add the new entry.
-	existingEntry = fc.getEntry(key)
-	if existingEntry == nil {
-		fc.inTransit[key] = newEntry
+	if !closed {
+		existingEntry = fc.getEntry(key)
+		if existingEntry == nil {
+			fc.inTransit[key] = newEntry
+		}
 	}
 	fc.lock.Unlock()
+	if closed {
+		return ErrCacheClosed
+	}
 	if existingEntry != nil {
 		var notDeleted bool
 		notDeleted, err = existingEntry.copyTo(dst)
@@ -219,12 +265,13 @@ func (fc *Filecache) Get(dst io.Writer, key string) (err error) {
 func (fc *Filecache) hit(entry *cacheEntry) {
 	// update this entry's location in the file cache.
 	fc.lock.Lock()
+	closed := fc.closed
 	// It may have already been evicted by others, so check if we're still in the
 	// cache. Since we nil the links, we can just check those.
 
 	// There's another edge case: We are already the root. In that case, we don't
 	// have to do anything either.
-	if entry.prev != nil && fc.root != entry {
+	if !closed && entry.prev != nil && fc.root != entry {
 		// This is similar to insertEntry, except that we also have to remove our
 		// original position first. This is done by connecting prev and next to
 		// eachother.
@@ -250,46 +297,50 @@ func (fc *Filecache) insertEntry(entry *cacheEntry) {
 	// there are no other entries. Only values put in transit (and removed) will
 	// be given here, so it is sound.
 	fc.lock.Lock()
-	// No defer here, because this should NOT fail.
-	fc.size += entry.fileSize
-	delete(fc.inTransit, entry.key)
-	fc.cache[entry.key] = entry
+	closed := fc.closed
+	// If the cache was closed while we were in transit, then we're already
+	// scheduled for deletion, so we don't have to worry about deleting ourselves.
+	if !closed {
+		// No defer here, because this should NOT fail.
+		fc.size += entry.fileSize
+		delete(fc.inTransit, entry.key)
+		fc.cache[entry.key] = entry
 
-	// Put into LRU.
-	if fc.root == nil {
-		fc.root = entry
-		entry.prev = entry
-		entry.next = entry
-	} else {
-		// Explanation:
-		//              root
-		//               |
-		//               v
-		// +------+   +------+   +------+
-		// |r.prev|<->|   r  |<->|r.next|
-		// +------+   +------+   +------+
-		//
-		// Add replace entry with r, by bumping it to the right
-		//
-		//              root
-		//               |
-		//               v
-		// +------+   +------+   +------+    +------+
-		// |r.prev|<->| entry|<->|   r  |<-> |r.next|
-		// +------+   +------+   +------+    +------+
-		//
-		// (Obviously, r.prev is not r.prev anymore, but rather entry.prev)
+		// Put into LRU.
+		if fc.root == nil {
+			fc.root = entry
+			entry.prev = entry
+			entry.next = entry
+		} else {
+			// Explanation:
+			//              root
+			//               |
+			//               v
+			// +------+   +------+   +------+
+			// |r.prev|<->|   r  |<->|r.next|
+			// +------+   +------+   +------+
+			//
+			// Add replace entry with r, by bumping it to the right
+			//
+			//              root
+			//               |
+			//               v
+			// +------+   +------+   +------+    +------+
+			// |r.prev|<->| entry|<->|   r  |<-> |r.next|
+			// +------+   +------+   +------+    +------+
+			//
+			// (Obviously, r.prev is not r.prev anymore, but rather entry.prev)
 
-		entry.next = fc.root
-		entry.prev = fc.root.prev
-		entry.prev.next = entry
-		entry.next.prev = entry
-		fc.root = entry
+			entry.next = fc.root
+			entry.prev = fc.root.prev
+			entry.prev.next = entry
+			entry.next.prev = entry
+			fc.root = entry
+		}
+
+		// Then remove excessive entries.
+		fc.removeLRU()
 	}
-
-	// Then remove excessive entries.
-	fc.removeLRU()
-
 	fc.lock.Unlock()
 }
 
@@ -319,12 +370,14 @@ func (fc *Filecache) removeLRU() {
 		}
 
 	}
-	go deleteEntries(toDelete)
+	fc.deleters.Add(1)
+	go fc.deleteEntries(toDelete)
 }
 
 // deletesEntries deletes cache entries synchronously. This must not be done on
 // entries that are inside the cache, only the ones that are explicitly evicted.
-func deleteEntries(entries []*cacheEntry) {
+func (fc *Filecache) deleteEntries(entries []*cacheEntry) {
+	defer fc.deleters.Done()
 	for _, entry := range entries {
 		deleteEntry(entry)
 	}
