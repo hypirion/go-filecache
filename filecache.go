@@ -426,15 +426,13 @@ func copyFile(dst io.Writer, src string) error {
 		return err
 	}
 	defer f.Close() // Ugh, I'm not sure how to handle this particular error. If
-	// io.copy doesn't
+	// io.copy doesn't error out, then this shouldn't be an issue unless we end up
+	// being unable to read from the file again in the future.
 
 	_, err = io.Copy(dst, f)
 	// TODO: Wrap?
 	return err
 }
-
-// How to put into cache?
-// Add to in-transit
 
 func (fc *Filecache) Put(key string, src io.Reader) (err error) {
 	goodEntry := false
