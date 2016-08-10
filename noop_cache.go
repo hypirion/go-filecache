@@ -15,16 +15,16 @@ import (
 type NoopStore struct{}
 
 // Has from a NoopStore will always return false, nil.
-func (_ NoopStore) Has(key string) (bool, error) {
+func (NoopStore) Has(key string) (bool, error) {
 	return false, nil
 }
 
 // Get will return os.ErrNotExist.
-func (_ NoopStore) Get(_ io.Writer, key string) error {
+func (NoopStore) Get(_ io.Writer, key string) error {
 	return os.ErrNotExist
 }
 
 // Put does nothing and returns nil.
-func (_ NoopStore) Put(_ io.Writer, key string) error {
+func (NoopStore) Put(key string, _ io.Reader) error {
 	return nil
 }
