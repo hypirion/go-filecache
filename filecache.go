@@ -9,6 +9,8 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -207,7 +209,7 @@ func (fc *Filecache) Get(dst io.Writer, key string) (err error) {
 
 	// Create temp file to store contents in.
 	var entryFile *os.File
-	entryFile, err = ioutil.TempFile(fc.tmpFolder, key+"-")
+	entryFile, err = ioutil.TempFile(fc.tmpFolder, filifyKey(key))
 	if err != nil {
 		// TODO: wrap this one
 		return err
@@ -473,7 +475,7 @@ func (fc *Filecache) Put(key string, src io.Reader) (err error) {
 
 	// Create temp file to store contents in.
 	var entryFile *os.File
-	entryFile, err = ioutil.TempFile(fc.tmpFolder, key+"-")
+	entryFile, err = ioutil.TempFile(fc.tmpFolder, filifyKey(key))
 	if err != nil {
 		// TODO: wrap this one
 		return err
@@ -521,4 +523,8 @@ func (fc *Filecache) Put(key string, src io.Reader) (err error) {
 
 	goodEntry = true
 	return nil
+}
+
+func filifyKey(key string) string {
+	return strings.Replace(key, string(filepath.Separator), "_", -1) + "-"
 }
